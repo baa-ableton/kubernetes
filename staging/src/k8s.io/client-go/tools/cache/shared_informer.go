@@ -243,10 +243,38 @@ type SharedInformer interface {
 	// Please see the comment on TransformFunc for more details.
 	SetTransform(handler TransformFunc) error
 
+	// SetReflectorConfig configures backoff and watch timeout behavior for the
+	// underlying reflector. Must be called before the informer is started.
+	// Calling after start returns an error.
+	SetReflectorConfig(config ReflectorConfig) error
+
 	// IsStopped reports whether the informer has already been stopped.
 	// Adding event handlers to already stopped informers is not possible.
 	// An informer already stopped will never be started again.
 	IsStopped() bool
+}
+
+// ReflectorConfig holds optional configuration for a SharedInformer's underlying Reflector.
+// All fields are optional; zero values select appropriate defaults.
+type ReflectorConfig struct {
+	// Backoff configures the backoff strategy for retrying list/watch errors.
+	// If nil, the default exponential backoff is used (initial: 800ms, cap: 30s, factor: 2.0, jitter: 1.0).
+	Backoff *wait.Backoff
+
+	// BackoffResetDuration is how long without backoff activity before the backoff delay is
+	// reset to its initial value. Only used when Backoff is non-nil.
+	// If zero, defaults to 2 minutes.
+	BackoffResetDuration time.Duration
+
+	// MinWatchTimeout defines the minimum timeout for watch requests sent to kube-apiserver.
+	// Values lower than 5m will not be honored to avoid negative performance impact on the controlplane.
+	// If zero, defaults to 5 minutes.
+	MinWatchTimeout time.Duration
+
+	// MaxWatchTimeout defines the maximum timeout for watch requests.
+	// Actual timeout is chosen randomly in [MinWatchTimeout, MaxWatchTimeout].
+	// If zero, defaults to 2*MinWatchTimeout.
+	MaxWatchTimeout time.Duration
 }
 
 // Opaque interface representing the registration of ResourceEventHandler for
@@ -635,6 +663,9 @@ type sharedIndexInformer struct {
 
 	// keyFunc is called when processing deltas by the underlying process function.
 	keyFunc KeyFunc
+
+	// reflectorConfig holds optional backoff and timeout configuration for the underlying Reflector.
+	reflectorConfig ReflectorConfig
 }
 
 // dummyController hides the fact that a SharedInformer is different from a dedicated one
@@ -712,6 +743,18 @@ func (s *sharedIndexInformer) SetTransform(handler TransformFunc) error {
 	return nil
 }
 
+func (s *sharedIndexInformer) SetReflectorConfig(config ReflectorConfig) error {
+	s.startedLock.Lock()
+	defer s.startedLock.Unlock()
+
+	if s.started {
+		return fmt.Errorf("informer has already started")
+	}
+
+	s.reflectorConfig = config
+	return nil
+}
+
 func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	s.RunWithContext(wait.ContextForChannel(stopCh))
 }
@@ -738,6 +781,11 @@ func (s *sharedIndexInformer) RunWithContext(ctx context.Context) {
 			ObjectDescription: s.objectDescription,
 			FullResyncPeriod:  s.resyncCheckPeriod,
 			ShouldResync:      s.processor.shouldResync,
+
+			MinWatchTimeout:      s.reflectorConfig.MinWatchTimeout,
+			MaxWatchTimeout:      s.reflectorConfig.MaxWatchTimeout,
+			Backoff:              s.reflectorConfig.Backoff,
+			BackoffResetDuration: s.reflectorConfig.BackoffResetDuration,
 
 			Process: func(obj interface{}, isInInitialList bool) error {
 				return s.handleDeltas(logger, obj, isInInitialList)
